@@ -33,6 +33,7 @@ pest           = { version = "2", optional = true }
 pest_derive    = { version = "2", optional = true }
 serde = { version = "1.0", default-features = false, features = [ "derive" ], optional = true }
 itertools = "0.10"
+rayon = "*"
 
 [dev-dependencies]
 itertools = "0.10"

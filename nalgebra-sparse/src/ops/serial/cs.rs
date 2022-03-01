@@ -4,8 +4,10 @@ use crate::cs::CsMatrix;
 use crate::ops::serial::{OperationError, OperationErrorKind};
 use crate::ops::Op;
 use crate::SparseEntryMut;
+use itertools::{EitherOrBoth, Itertools};
 use nalgebra::{ClosedAdd, ClosedMul, DMatrixSlice, DMatrixSliceMut, Scalar};
 use num_traits::{One, Zero};
+use rayon::prelude::*;
 
 //fn spmm_cs_unexpected_entry() -> OperationError {
 //    OperationError::from_kind_and_message(
@@ -71,6 +73,91 @@ where
     }
 
     Ok(())
+}
+
+pub fn _spmm_cs_prealloc_parallel<T>(
+    _beta: T,
+    //c: &mut CsMatrix<T>,
+    alpha: T,
+    a: &CsMatrix<T>,
+    b: &CsMatrix<T>,
+) -> Result<CsMatrix<T>, OperationError>
+where
+    T: Scalar + ClosedAdd + ClosedMul + Zero + One + Send + Sync + Sized + Copy,
+{
+    let num_rows = a.pattern().major_dim();
+    let _matrix_triplet = (0..num_rows)
+        .into_par_iter()
+        .map(|row_id| {
+            let a_lane = a.get_lane(row_id).unwrap();
+            let _b_lane = b.get_lane(row_id);
+            let (indices, values) = a_lane
+                .minor_indices()
+                .into_par_iter()
+                .zip(a_lane.values().into_par_iter())
+                .map(|(k, a_ik)| {
+                    let zero_value: T = Zero::zero();
+                    let mut scatter_values = vec![zero_value; b.pattern().minor_dim()];
+                    let mut scatter_indices = vec![];
+                    let b_lane = b.get_lane(*k);
+                    b_lane.map(|b_row| {
+                        b_row
+                            .minor_indices()
+                            .into_iter()
+                            .zip(b_row.values().into_iter())
+                            .for_each(|(j, b_kj)| {
+                                scatter_values[*j] += alpha.clone() * a_ik.clone() * b_kj.clone();
+                                scatter_indices.push(*j);
+                            });
+                    });
+                    (scatter_indices, scatter_values)
+                })
+                .reduce(
+                    || (vec![], vec![]),
+                    move |left_tuple, right_tuple| {
+                        let (left_indices, mut left_values) = left_tuple;
+                        let (right_indices, right_values) = right_tuple;
+                        (
+                            left_indices
+                                .iter()
+                                .merge_join_by(right_indices.iter(), |l, r| l.cmp(r))
+                                .map(|some_val| match some_val {
+                                    EitherOrBoth::Right(r) => {
+                                        left_values[*r] = right_values[*r];
+                                        r.clone()
+                                    }
+                                    EitherOrBoth::Both(l, r) => {
+                                        left_values[*l] += right_values[*r];
+                                        l.clone()
+                                    }
+                                    EitherOrBoth::Left(l) => l.clone(),
+                                })
+                                .collect_vec(),
+                            //left_values
+                            //    .iter_mut()
+                            //    .zip(right_values.iter())
+                            //    .for_each(|(l, r)| {
+                            //        // shitty linear, change it to sparse iteration space
+                            //        *l += r.clone();
+                            //    });
+                            left_values,
+                        )
+                    },
+                );
+            // Now we have computed one row of C in parallel.
+            // Return a sparse vector with offset, indices, values
+            (vec![indices.len()], indices, values)
+        })
+        .reduce_with(|left_triplet, right_triplet| {
+            let (_left_offset, _left_indices, _left_values) = left_triplet;
+            let (_right_offset, _right_indices, _right_values) = right_triplet;
+            //offsets need some kind of a prefix sum
+            //indices mostly just need to be extended
+            //values need to be compressed, zeros thrown out and then concatenated.
+            panic!("NotImplemented")
+        });
+    //Ok(())
+    panic!("NotImplemented")
 }
 
 fn spadd_cs_unexpected_entry() -> OperationError {
