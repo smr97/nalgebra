@@ -57,6 +57,7 @@ mod csc;
 mod csr;
 mod pattern;
 
+pub use cs::spmm_cs_prealloc_parallel;
 pub use csc::*;
 pub use csr::*;
 pub use pattern::*;

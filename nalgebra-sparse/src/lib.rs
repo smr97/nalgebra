@@ -175,6 +175,7 @@ pub use self::coo::CooMatrix;
 pub use self::csc::CscMatrix;
 pub use self::csr::CsrMatrix;
 
+pub use self::ops::serial::spmm_cs_prealloc_parallel;
 /// Errors produced by functions that expect well-formed sparse format data.
 #[derive(Debug)]
 pub struct SparseFormatError {

@@ -149,6 +149,13 @@ impl<T> CsrMatrix<T> {
         }
     }
 
+    /// Create a zero CSR matrix with no explicitly stored entries.
+    pub fn get_cs(&self) -> CsMatrix<T>
+    where
+        T: Clone,
+    {
+        self.cs.clone()
+    }
     /// Try to construct a CSR matrix from raw CSR data.
     ///
     /// It is assumed that each row contains unique and sorted column indices that are in

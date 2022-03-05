@@ -3,6 +3,7 @@
 use crate::cs::CsMatrix;
 use crate::ops::serial::{OperationError, OperationErrorKind};
 use crate::ops::Op;
+use crate::pattern::{SparsityPattern, SparsityPatternFormatError};
 use crate::SparseEntryMut;
 use itertools::{EitherOrBoth, Itertools};
 use nalgebra::{ClosedAdd, ClosedMul, DMatrixSlice, DMatrixSliceMut, Scalar};
@@ -75,20 +76,21 @@ where
     Ok(())
 }
 
-pub fn _spmm_cs_prealloc_parallel<T>(
-    _beta: T,
+/// First implementation of parallel SpGEMM
+pub fn spmm_cs_prealloc_parallel<T>(
     //c: &mut CsMatrix<T>,
     alpha: T,
     a: &CsMatrix<T>,
     b: &CsMatrix<T>,
-) -> Result<CsMatrix<T>, OperationError>
+) -> Result<CsMatrix<T>, SparsityPatternFormatError>
 where
     T: Scalar + ClosedAdd + ClosedMul + Zero + One + Send + Sync + Sized + Copy,
 {
     let num_rows = a.pattern().major_dim();
-    let _matrix_triplet = (0..num_rows)
+    let (mut offset, indices, values) = (0..num_rows)
         .into_par_iter()
         .map(|row_id| {
+            //TODO lanes may not exist? Handle the unwrap panics.
             let a_lane = a.get_lane(row_id).unwrap();
             let _b_lane = b.get_lane(row_id);
             let (indices, values) = a_lane
@@ -112,52 +114,62 @@ where
                     });
                     (scatter_indices, scatter_values)
                 })
-                .reduce(
-                    || (vec![], vec![]),
-                    move |left_tuple, right_tuple| {
-                        let (left_indices, mut left_values) = left_tuple;
-                        let (right_indices, right_values) = right_tuple;
-                        (
-                            left_indices
-                                .iter()
-                                .merge_join_by(right_indices.iter(), |l, r| l.cmp(r))
-                                .map(|some_val| match some_val {
-                                    EitherOrBoth::Right(r) => {
-                                        left_values[*r] = right_values[*r];
-                                        r.clone()
-                                    }
-                                    EitherOrBoth::Both(l, r) => {
-                                        left_values[*l] += right_values[*r];
-                                        l.clone()
-                                    }
-                                    EitherOrBoth::Left(l) => l.clone(),
-                                })
-                                .collect_vec(),
-                            //left_values
-                            //    .iter_mut()
-                            //    .zip(right_values.iter())
-                            //    .for_each(|(l, r)| {
-                            //        // shitty linear, change it to sparse iteration space
-                            //        *l += r.clone();
-                            //    });
-                            left_values,
-                        )
-                    },
-                );
+                .reduce_with(move |left_tuple, right_tuple| {
+                    let (left_indices, mut left_values) = left_tuple;
+                    let (right_indices, right_values) = right_tuple;
+                    let total_indices = left_indices
+                        .iter()
+                        .merge_join_by(right_indices.iter(), |l, r| l.cmp(r))
+                        .map(|some_val| match some_val {
+                            EitherOrBoth::Right(r) => {
+                                left_values[*r] = right_values[*r];
+                                r.clone()
+                            }
+                            EitherOrBoth::Both(l, r) => {
+                                left_values[*l] += right_values[*r];
+                                l.clone()
+                            }
+                            EitherOrBoth::Left(l) => l.clone(),
+                        })
+                        .collect_vec();
+
+                    (total_indices, left_values)
+                })
+                .unwrap();
             // Now we have computed one row of C in parallel.
             // Return a sparse vector with offset, indices, values
-            (vec![indices.len()], indices, values)
+            let non_zeros = indices
+                .iter()
+                .map(move |index| values[*index])
+                .collect_vec();
+            (vec![indices.len()], indices, non_zeros)
         })
         .reduce_with(|left_triplet, right_triplet| {
-            let (_left_offset, _left_indices, _left_values) = left_triplet;
-            let (_right_offset, _right_indices, _right_values) = right_triplet;
+            let (mut left_offset, mut left_indices, mut left_values) = left_triplet;
+            let (mut right_offset, right_indices, right_values) = right_triplet;
             //offsets need some kind of a prefix sum
+            let offset_correction = left_offset.last().unwrap();
+            right_offset
+                .iter_mut()
+                .for_each(|v| *v += offset_correction);
+            left_offset.extend(right_offset);
             //indices mostly just need to be extended
-            //values need to be compressed, zeros thrown out and then concatenated.
-            panic!("NotImplemented")
-        });
+            left_indices.extend(right_indices);
+            //values were compressed in the previous reduction to have only the non-zeros.
+            //concatenate them just like that
+            left_values.extend(right_values);
+            (left_offset, left_indices, left_values)
+        })
+        .unwrap();
+    offset.insert(0, 0);
+    SparsityPattern::try_from_offsets_and_indices(
+        num_rows,
+        b.pattern().minor_dim(),
+        offset,
+        indices,
+    )
+    .map(|pattern| CsMatrix::from_pattern_and_values(pattern, values))
     //Ok(())
-    panic!("NotImplemented")
 }
 
 fn spadd_cs_unexpected_entry() -> OperationError {
