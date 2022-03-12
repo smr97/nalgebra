@@ -5,6 +5,7 @@ use crate::ops::serial::{OperationError, OperationErrorKind};
 use crate::ops::Op;
 use crate::pattern::{SparsityPattern, SparsityPatternFormatError};
 use crate::SparseEntryMut;
+use hashbrown::HashMap;
 use itertools::{EitherOrBoth, Itertools};
 use nalgebra::{ClosedAdd, ClosedMul, DMatrixSlice, DMatrixSliceMut, Scalar};
 use num_traits::{One, Zero};
@@ -98,9 +99,10 @@ where
                 .into_par_iter()
                 .zip(a_lane.values().into_par_iter())
                 .map(|(k, a_ik)| {
-                    let zero_value: T = Zero::zero();
-                    let mut scatter_values = vec![zero_value; b.pattern().minor_dim()];
-                    let mut scatter_indices = vec![];
+                    //let zero_value: T = Zero::zero();
+                    //let mut scatter_values = vec![zero_value; b.pattern().minor_dim()];
+                    let mut scatter_values = HashMap::new();
+                    //let mut scatter_indices = vec![];
                     let b_lane = b.get_lane(*k);
                     b_lane.map(|b_row| {
                         b_row
@@ -108,11 +110,19 @@ where
                             .into_iter()
                             .zip(b_row.values().into_iter())
                             .for_each(|(j, b_kj)| {
-                                scatter_values[*j] += alpha.clone() * a_ik.clone() * b_kj.clone();
-                                scatter_indices.push(*j);
+                                if let Some(val) = scatter_values.get_mut(j) {
+                                    *val += alpha.clone() * a_ik.clone() * b_kj.clone();
+                                } else {
+                                    scatter_values
+                                        .insert(*j, alpha.clone() * a_ik.clone() * b_kj.clone());
+                                }
+                                //scatter_indices.push(*j);
                             });
                     });
-                    (scatter_indices, scatter_values)
+                    (
+                        scatter_values.keys().sorted().cloned().collect_vec(),
+                        scatter_values,
+                    )
                 })
                 .reduce_with(move |left_tuple, right_tuple| {
                     let (left_indices, mut left_values) = left_tuple;
@@ -122,11 +132,11 @@ where
                         .merge_join_by(right_indices.iter(), |l, r| l.cmp(r))
                         .map(|some_val| match some_val {
                             EitherOrBoth::Right(r) => {
-                                left_values[*r] = right_values[*r];
+                                left_values.insert(*r, right_values[r]);
                                 r.clone()
                             }
                             EitherOrBoth::Both(l, r) => {
-                                left_values[*l] += right_values[*r];
+                                left_values.get_mut(l).map(|val| *val += right_values[r]);
                                 l.clone()
                             }
                             EitherOrBoth::Left(l) => l.clone(),
@@ -138,10 +148,7 @@ where
                 .unwrap();
             // Now we have computed one row of C in parallel.
             // Return a sparse vector with offset, indices, values
-            let non_zeros = indices
-                .iter()
-                .map(move |index| values[*index])
-                .collect_vec();
+            let non_zeros = indices.iter().map(move |index| values[index]).collect_vec();
             (vec![indices.len()], indices, non_zeros)
         })
         .reduce_with(|left_triplet, right_triplet| {
