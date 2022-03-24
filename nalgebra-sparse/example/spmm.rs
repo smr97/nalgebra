@@ -37,9 +37,11 @@ fn main() {
                 let spmm_time = now.elapsed().as_millis();
                 println!("SGEMM parallel time was {}", spmm_time);
                 println!(
-                    "Error {}",
-                    spmm_result_parallel.values().into_iter().sum::<f64>()
-                        - spmm_result.get_cs().values().into_iter().sum::<f64>()
+                    "Error {}%",
+                    (spmm_result_parallel.values().into_iter().sum::<f64>()
+                        - spmm_result.get_cs().values().into_iter().sum::<f64>())
+                        / spmm_result.get_cs().values().into_iter().sum::<f64>()
+                        * 100.0
                 );
             }
         }
