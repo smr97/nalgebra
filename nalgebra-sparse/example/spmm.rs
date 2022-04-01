@@ -11,7 +11,7 @@ use nalgebra_sparse::io::load_coo_from_matrix_market_file;
 fn main() {
     #[cfg(feature = "io")]
     {
-        let mut file_iter = fs::read_dir("data").unwrap();
+        let mut file_iter = fs::read_dir("data/").unwrap();
         for f in file_iter {
             let f = f.unwrap().path();
             //println!("extension {:?}", f.extension());
