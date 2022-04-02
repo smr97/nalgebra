@@ -1,13 +1,17 @@
+use std::collections::LinkedList;
+//use std::time::Instant;
+
 use crate::cs::CsMatrix;
 use crate::ops::serial::{OperationError, OperationErrorKind};
 use crate::ops::Op;
-use crate::pattern::{SparsityPattern, SparsityPatternFormatError};
+use crate::pattern::SparsityPatternFormatError;
 use crate::SparseEntryMut;
 use fxhash::FxHashMap;
 use itertools::Itertools;
 use nalgebra::{ClosedAdd, ClosedMul, DMatrixSlice, DMatrixSliceMut, Scalar};
 use num_traits::{One, Zero};
-use rayon::prelude::*;
+//use rayon::prelude::*;
+use rayon_logs::{prelude::*, subgraph, ThreadPoolBuilder};
 
 /// Helper functionality for implementing CSR/CSC SPMM.
 ///
@@ -67,85 +71,137 @@ pub fn spmm_cs_prealloc_parallel<T>(
 where
     T: Scalar + ClosedAdd + ClosedMul + Zero + One + Send + Sync + Sized + Copy,
 {
+    let pool = ThreadPoolBuilder::new()
+        .num_threads(2)
+        .build()
+        .expect("building pool failed");
     let num_rows = a.pattern().major_dim();
-    let (mut offset, indices, values) = (0..num_rows)
-        .into_par_iter()
-        .map(|row_id| {
-            //TODO lanes may not exist? Handle the unwrap panics.
-            let a_lane = a.get_lane(row_id).unwrap();
-            let _b_lane = b.get_lane(row_id);
-            let mut c_row_hash = a_lane
-                .minor_indices()
+    //let now = Instant::now();
+    //let (list_of_rows, runlog) =
+    pool.compare()
+        .runs_number(1)
+        .attach_algorithm_nodisplay("parallel spgemm", || {
+            (0..num_rows)
                 .into_par_iter()
-                .zip(a_lane.values().into_par_iter())
                 .fold(
-                    || FxHashMap::default(),
-                    |mut scatter_values: FxHashMap<usize, T>, a_element_tuple| {
-                        let (k, a_ik) = a_element_tuple;
-                        let b_lane = b.get_lane(*k);
-                        b_lane.map(|b_row| {
-                            b_row
-                                .minor_indices()
-                                .into_iter()
-                                .zip(b_row.values().into_iter())
-                                .for_each(|(j, b_kj)| {
-                                    let some_entry =
-                                        scatter_values.entry(*j).or_insert(Zero::zero());
-                                    *some_entry += alpha.clone() * a_ik.clone() * b_kj.clone();
+                    || (LinkedList::new()),
+                    |mut list_of_hashes, a_row_id| {
+                        let a_lane = a.get_lane(a_row_id).unwrap();
+                        let _b_lane = b.get_lane(a_row_id);
+                        let c_row_hash = a_lane
+                        .indices_and_values()
+                        //.minor_indices()
+                        .into_par_iter()
+                        //.zip(a_lane.values().into_par_iter())
+                        .fold(
+                            || FxHashMap::default(),
+                            |mut scatter_values: FxHashMap<usize, T>, a_element_tuple| {
+                                subgraph("b row iteration", 0, ||{
+                                let (k, a_ik) = a_element_tuple;
+                                let b_lane = b.get_lane(*k);
+                                b_lane.map(|b_row| {
+                                    b_row
+                                        .minor_indices()
+                                        .into_iter()
+                                        .zip(b_row.values().into_iter())
+                                        .for_each(|(j, b_kj)| {
+                                            let some_entry =
+                                                scatter_values.entry(*j).or_insert(Zero::zero());
+                                            *some_entry +=
+                                                alpha.clone() * a_ik.clone() * b_kj.clone();
+                                        });
                                 });
-                        });
-                        scatter_values
+                                scatter_values
+                            })
+                        })
+                        .reduce(
+                            || FxHashMap::default(),
+                            move |mut left_hash, right_hash| {
+                                let new_right_hash =
+                                    left_hash
+                                        .drain()
+                                        .fold(right_hash, |mut right_hash, (k, v)| {
+                                            let right_entry =
+                                                right_hash.entry(k).or_insert(Zero::zero());
+                                            *right_entry += v;
+                                            right_hash
+                                        });
+                                new_right_hash
+                            },
+                        );
+                        //c_row_hash is now one full row of C
+                        list_of_hashes.push_back(c_row_hash);
+                        list_of_hashes
                     },
                 )
+                .map(|list_of_hashes| {
+                    subgraph(
+                        "hashmap to vecs",
+                        list_of_hashes.iter().map(|map| map.len()).sum(),
+                        || {
+                            list_of_hashes.into_iter().fold(
+                                LinkedList::new(),
+                                |mut list: LinkedList<(Vec<usize>, Vec<T>)>, mut c_row_hash| {
+                                    list.push_back(
+                                        c_row_hash
+                                            .drain()
+                                            .sorted_unstable_by(|left, right| left.0.cmp(&right.0))
+                                            .unzip(),
+                                    );
+                                    list
+                                },
+                            )
+                        },
+                    )
+                })
                 .reduce(
-                    || FxHashMap::default(),
-                    move |mut left_hash, right_hash| {
-                        let new_right_hash =
-                            left_hash
-                                .drain()
-                                .fold(right_hash, |mut right_hash, (k, v)| {
-                                    let right_entry = right_hash.entry(k).or_insert(Zero::zero());
-                                    *right_entry += v;
-                                    right_hash
-                                });
-                        new_right_hash
+                    || LinkedList::new(),
+                    |mut left_list, mut right_list| {
+                        left_list.append(&mut right_list);
+                        left_list
                     },
                 );
-            // Now we have computed one row of C in parallel.
-            // Return a sparse vector with offset, indices, values
-            let (indices, values): (Vec<_>, Vec<_>) =
-                c_row_hash.drain().sorted_by_key(|pair| pair.0).unzip();
-            (vec![indices.len()], indices, values)
         })
-        .reduce(
-            || (vec![], vec![], vec![]),
-            |left_triplet, right_triplet| {
-                let (mut left_offset, mut left_indices, mut left_values) = left_triplet;
-                let (mut right_offset, right_indices, right_values) = right_triplet;
-                //offsets need some kind of a prefix sum
-                left_offset.last().map(|offset_correction| {
-                    right_offset
-                        .iter_mut()
-                        .for_each(|v| *v += offset_correction);
-                });
-                left_offset.extend(right_offset);
-                //indices mostly just need to be extended
-                left_indices.extend(right_indices);
-                //values were compressed in the previous reduction to have only the non-zeros.
-                //concatenate them just like that
-                left_values.extend(right_values);
-                (left_offset, left_indices, left_values)
-            },
-        );
+        .generate_logs("report.html")
+        .expect("error saving report");
+    //runlog
+    //    .save_svg("./parallel_run.svg")
+    //    .expect("couldn't save log");
+    panic!("not implemented");
+    //let parallel_time = now.elapsed();
+    //let now = Instant::now();
+    //let offsets = list_of_rows.iter().fold(vec![0], |mut offsets, row| {
+    //    offsets.push(offsets.last().map_or(row.0.len(), |offset_correction| {
+    //        offset_correction + row.0.len()
+    //    }));
+    //    offsets
+    //});
+    //let indices: Vec<_> = list_of_rows
+    //    .iter()
+    //    .map(|(indices, _values)| indices)
+    //    .flatten()
+    //    .cloned()
+    //    .collect();
 
-    offset.insert(0, 0);
-    SparsityPattern::try_from_offsets_and_indices(
-        num_rows,
-        b.pattern().minor_dim(),
-        offset,
-        indices,
-    )
-    .map(|pattern| CsMatrix::from_pattern_and_values(pattern, values))
+    //let values: Vec<_> = list_of_rows
+    //    .iter()
+    //    .map(|(_indices, values)| values)
+    //    .flatten()
+    //    .cloned()
+    //    .collect();
+    //let collections_time = now.elapsed();
+    //println!(
+    //    "Parallel time was {:?}, collections time was {:?}",
+    //    parallel_time, collections_time
+    //);
+
+    //SparsityPattern::try_from_offsets_and_indices(
+    //    num_rows,
+    //    b.pattern().minor_dim(),
+    //    offsets,
+    //    indices,
+    //)
+    //.map(|pattern| CsMatrix::from_pattern_and_values(pattern, values))
 }
 
 fn spadd_cs_unexpected_entry() -> OperationError {

@@ -414,6 +414,9 @@ macro_rules! impl_cs_lane_common_methods {
                     global_col_index,
                 )
             }
+            pub fn indices_and_values(self) -> (&'a [usize], &'a [T]) {
+                (self.minor_indices, self.values)
+            }
         }
     };
 }

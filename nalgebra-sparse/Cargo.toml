@@ -35,6 +35,7 @@ serde = { version = "1.0", default-features = false, features = [ "derive" ], op
 itertools = "0.10"
 rayon = "*"
 fxhash = "*"
+rayon_logs = {git = "https://github.com/wagnerf42/rayon-logs.git"}
 
 [dev-dependencies]
 itertools = "0.10"
