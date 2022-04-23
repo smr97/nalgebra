@@ -7,6 +7,7 @@ use crate::ops::Op;
 use nalgebra::{ClosedAdd, ClosedMul, DMatrixSlice, DMatrixSliceMut, Scalar};
 use num_traits::{One, Zero};
 use std::borrow::Cow;
+use std::time::Instant;
 
 /// Sparse-dense matrix-matrix multiplication `C <- beta * C + alpha * op(A) * op(B)`.
 pub fn spmm_csr_dense<'a, T>(
@@ -108,7 +109,11 @@ where
 
     match (&a, &b) {
         (NoOp(ref a), NoOp(ref b)) => {
-            spmm_cs_prealloc_unchecked(beta, &mut c.cs, alpha, &a.cs, &b.cs)
+            let now = Instant::now();
+            let something = spmm_cs_prealloc_unchecked(beta, &mut c.cs, alpha, &a.cs, &b.cs);
+            let spmm_time = now.elapsed().as_millis();
+            println!("SGEMM inner kernel time was {}", spmm_time);
+            something
         }
         _ => spmm_csr_transposed(beta, c, alpha, a, b, spmm_csr_prealloc_unchecked),
     }
