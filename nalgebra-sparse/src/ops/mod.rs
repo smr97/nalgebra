@@ -125,6 +125,7 @@
 //! always be verified by performance profiling!
 
 mod impl_std_ops;
+pub mod parallel;
 pub mod serial;
 
 /// Determines whether a matrix should be transposed in a given operation.
