@@ -34,8 +34,10 @@ fn main() {
                     &sparse_input_matrix.get_cs(),
                 )
                 .unwrap();
-                let spmm_time = now.elapsed().as_millis();
-                println!("SGEMM parallel time was {}", spmm_time);
+                let spmm_time_parallel = now.elapsed().as_millis();
+                println!("SGEMM parallel time was {}", spmm_time_parallel);
+                println!("Speedup: {}", spmm_time as f32 / spmm_time_parallel as f32);
+
                 println!(
                     "Error {}%",
                     (spmm_result_parallel.values().into_iter().sum::<f64>()
