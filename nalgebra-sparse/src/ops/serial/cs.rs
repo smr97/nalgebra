@@ -65,6 +65,38 @@ where
     Ok(())
 }
 
+///
+/// We assume here that the matrices have already been verified to be dimensionally compatible.
+pub fn spmm_cs_small_matrix<T>(a: &CsMatrix<T>, b: &CsMatrix<T>) -> CsMatrix<T>
+where
+    T: Scalar + ClosedAdd + ClosedMul + Zero + One,
+{
+    let some_val = Zero::zero();
+
+    for (&k, a_ik) in a_lane_i.minor_indices().iter().zip(a_lane_i.values()) {
+        let b_lane_k = b.get_lane(k).unwrap();
+        let alpha_aik = alpha.clone() * a_ik.clone();
+        for (j, b_kj) in b_lane_k.minor_indices().iter().zip(b_lane_k.values()) {
+            // use a dense scatter vector to accumulate non-zeros quickly
+            unsafe {
+                *scratchpad_values.get_unchecked_mut(*j) += alpha_aik.clone() * b_kj.clone();
+            }
+        }
+    }
+
+    //Get indices from C pattern and gather from the dense scratchpad_values
+    let (indices, values) = c_lane_i.indices_and_values_mut();
+    values
+        .iter_mut()
+        .zip(indices)
+        .for_each(|(output_ref, index)| unsafe {
+            *output_ref =
+                beta.clone() * output_ref.clone() + scratchpad_values.get_unchecked(*index).clone();
+            *scratchpad_values.get_unchecked_mut(*index) = Zero::zero();
+        });
+    unimplemented!()
+}
+
 pub fn spmm_cs_prealloc<T>(
     beta: T,
     c: &mut CsMatrix<T>,

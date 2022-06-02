@@ -15,6 +15,7 @@ const NUM_DWORDS_IN_L2: usize = 524288;
 /// Task struct for the product:- result = left * right.
 /// Represents the task in the form of two pointers for each input matrix, start/end for each
 /// matrix.
+/// As we cut the pointers in half, we are basically cutting the dense space in half each time.
 struct SpGEMMTask<'a, T> {
     left_matrix: &'a CsMatrix<T>,
     left_start: usize,
@@ -68,6 +69,7 @@ where
             (top_task, bottom_task)
         } else {
             //cut right matrix on cols only
+            //TODO check for crossover errors. the bounds may be wrong.
             let left_task = SpGEMMTask {
                 left_matrix: self.left_matrix,
                 right_matrix: self.right_matrix,
@@ -98,11 +100,12 @@ where
 }
 
 impl<'a, T> Iterator for SpGEMMTask<'a, T> {
-    type Item = CsMatrix<T>;
-    // This call should finish the given SpGEMMTask sequentially
-    // We need a fast SpGEMM kernel specialised for one-shot multiplies.
-    // Do away with symbolic + actual computation.
+    type Item = CsMatrix<T>; // We probably also need to maintain some pointers to know where this fits in the big matrix
+                             // This call should finish the given SpGEMMTask sequentially
+                             // We need a fast SpGEMM kernel specialised for one-shot multiplies.
+                             // Do away with symbolic + actual computation.
     fn next(&mut self) -> Option<Self::Item> {
+        let result_matrix = self.left_matrix * self.right_matrix;
         unimplemented!();
     }
 }
