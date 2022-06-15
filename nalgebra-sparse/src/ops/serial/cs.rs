@@ -1,5 +1,6 @@
+use std::cell::Cell;
 use std::collections::LinkedList;
-use std::time::Instant;
+//use std::time::Instant;
 
 use crate::cs::CsMatrix;
 use crate::ops::serial::{OperationError, OperationErrorKind};
@@ -11,6 +12,7 @@ use itertools::Itertools;
 use nalgebra::{ClosedAdd, ClosedMul, DMatrixSlice, DMatrixSliceMut, Scalar};
 use num_traits::{One, Zero};
 use rayon::prelude::*;
+use thread_local::ThreadLocal;
 
 /// Helper functionality for implementing CSR/CSC SPMM.
 ///
@@ -61,7 +63,33 @@ where
     Ok(())
 }
 
-/// First implementation of parallel SpGEMM
+struct ThreadLocalResult<T> {
+    output_rows: LinkedList<(usize, FxHashMap<usize, T>)>, //this is a list of output rows that the thread has computed till now.
+                                                           //first element of each ordered pair in this list tells you which row we're talking about,
+                                                           //and the second element is a small hashmap representing the row itself.
+}
+
+fn slice_to_subslices<'a, T>(
+    some_slice: &'a mut [T],
+    cut_points: &Vec<usize>,
+) -> LinkedList<&'a mut [T]> {
+    cut_points
+        .iter()
+        .zip(cut_points.iter().skip(1))
+        .fold(LinkedList::new(), |mut list, (l, r)| {
+            assert!(*l < some_slice.len() && some_slice.len() >= *r);
+            let base_ptr = some_slice.as_mut_ptr();
+            unsafe {
+                let subslice = std::slice::from_raw_parts_mut(base_ptr.offset(*l as isize), r - l);
+                list.push_back(subslice);
+            }
+            list
+        })
+}
+
+/// each thread has a thread-local struct that it keeps on growing.
+/// This contains a non-contiguous list of rows of the output sparse matrix. Which is basically
+/// DCSR
 pub fn spmm_cs_prealloc_parallel<T>(
     alpha: T,
     a: &CsMatrix<T>,
@@ -71,85 +99,92 @@ where
     T: Scalar + ClosedAdd + ClosedMul + Zero + One + Send + Sync + Sized + Copy,
 {
     let num_rows = a.pattern().major_dim();
-    let now = Instant::now();
-    let list_of_rows = (0..num_rows)
-        .into_par_iter()
-        .fold(
-            || (LinkedList::new()),
-            |mut list_of_hashes, a_row_id| {
-                let a_lane = a.get_lane(a_row_id).unwrap();
-                let _b_lane = b.get_lane(a_row_id);
-                let c_row_hash = a_lane.minor_indices().iter().zip(a_lane.values()).fold(
-                    FxHashMap::default(),
-                    |mut scatter_values: FxHashMap<usize, T>, a_element_tuple| {
-                        let (k, a_ik) = a_element_tuple;
-                        let b_lane = b.get_lane(*k);
-                        b_lane.map(|b_row| {
-                            b_row
-                                .minor_indices()
-                                .into_iter()
-                                .zip(b_row.values().into_iter())
-                                .for_each(|(j, b_kj)| {
-                                    let some_entry =
-                                        scatter_values.entry(*j).or_insert(Zero::zero());
-                                    *some_entry += alpha.clone() * a_ik.clone() * b_kj.clone();
-                                });
+    let all_thread_results = ThreadLocal::new();
+    (0..num_rows).into_par_iter().for_each(|a_row_id| {
+        let my_state = all_thread_results.get_or(|| {
+            Cell::new(ThreadLocalResult {
+                output_rows: LinkedList::new(),
+            })
+        });
+        let mut old_result = my_state.replace(ThreadLocalResult {
+            output_rows: LinkedList::new(),
+        });
+        let a_lane = a.get_lane(a_row_id).unwrap();
+        let _b_lane = b.get_lane(a_row_id);
+        let c_row_hash = a_lane.minor_indices().iter().zip(a_lane.values()).fold(
+            FxHashMap::default(),
+            |mut scatter_values: FxHashMap<usize, T>, a_element_tuple| {
+                let (k, a_ik) = a_element_tuple;
+                let b_lane = b.get_lane(*k);
+                b_lane.map(|b_row| {
+                    b_row
+                        .minor_indices()
+                        .into_iter()
+                        .zip(b_row.values().into_iter())
+                        .for_each(|(j, b_kj)| {
+                            let some_entry = scatter_values.entry(*j).or_insert(Zero::zero());
+                            *some_entry += alpha.clone() * a_ik.clone() * b_kj.clone();
                         });
-                        scatter_values
-                    },
-                );
-                //c_row_hash is now one full row of C
-                list_of_hashes.push_back(c_row_hash);
-                list_of_hashes
-            },
-        )
-        .map(|list_of_hashes| {
-            list_of_hashes.into_iter().fold(
-                LinkedList::new(),
-                |mut list: LinkedList<(Vec<usize>, Vec<T>)>, mut c_row_hash| {
-                    list.push_back(
-                        c_row_hash
-                            .drain()
-                            .sorted_unstable_by(|left, right| left.0.cmp(&right.0))
-                            .unzip(),
-                    );
-                    list
-                },
-            )
-        })
-        .reduce(
-            || LinkedList::new(),
-            |mut left_list, mut right_list| {
-                left_list.append(&mut right_list);
-                left_list
+                });
+                scatter_values
             },
         );
-    let parallel_time = now.elapsed();
-    let now = Instant::now();
-    let offsets = list_of_rows.iter().fold(vec![0], |mut offsets, row| {
-        offsets.push(offsets.last().map_or(row.0.len(), |offset_correction| {
-            offset_correction + row.0.len()
-        }));
-        offsets
+        //c_row_hash is now one full row of C
+        old_result.output_rows.push_back((a_row_id, c_row_hash));
+        my_state.replace(old_result);
     });
-    let indices: Vec<_> = list_of_rows
+    let all_results =
+        all_thread_results
+            .into_iter()
+            .fold(LinkedList::new(), |mut list, some_result| {
+                let mut some_result = some_result.replace(ThreadLocalResult {
+                    output_rows: LinkedList::new(),
+                });
+                list.append(&mut some_result.output_rows);
+                list
+            });
+    let num_nnzs = all_results
         .iter()
-        .map(|(indices, _values)| indices)
-        .flatten()
-        .cloned()
-        .collect();
+        .map(|(_row_id, row_hash)| row_hash.len())
+        .sum();
+    let mut indices = vec![0usize; num_nnzs];
+    let mut values = vec![Zero::zero(); num_nnzs];
 
-    let values: Vec<_> = list_of_rows
-        .iter()
-        .map(|(_indices, values)| values)
-        .flatten()
-        .cloned()
+    //Make a list of mutable slices of indices and values.
+
+    let all_results: LinkedList<_> = all_results
+        .into_iter()
+        .sorted_unstable_by(|(left_id, _), (right_id, _)| left_id.cmp(right_id))
         .collect();
-    let collections_time = now.elapsed();
-    println!(
-        "Parallel time was {:?}, collections time was {:?}",
-        parallel_time, collections_time
-    );
+    let offsets = all_results.iter().fold(vec![0], |mut v, (_, row_hash)| {
+        v.push(v.last().unwrap_or(&0) + row_hash.len());
+        v
+    });
+    let list_of_index_slices = slice_to_subslices(&mut indices, &offsets);
+    let list_of_values_slices = slice_to_subslices(&mut values, &offsets);
+    let all_results = all_results
+        .into_iter()
+        .zip(list_of_index_slices.into_iter())
+        .zip(list_of_values_slices.into_iter())
+        .map(|(((_id, hash), index_slice), value_slice)| (hash, index_slice, value_slice))
+        .collect::<LinkedList<_>>();
+    all_results
+        .into_par_iter()
+        .for_each(|(mut row_hash, index_ref, value_ref)| {
+            //let indices_ref = get_mut_slice(&mut indices, offsets[row_id], offsets[row_id + 1]);
+            //let values_ref = get_mut_slice(&mut values, offsets[row_id], offsets[row_id + 1]);
+            //drain the hashmap of this row into a slice of the indices and the values array
+            //first get the column co-ordinates in sorted order for the given row, and then for each
+            //non-zero, copy to the above slices at the right position
+            row_hash
+                .drain()
+                .sorted_unstable_by(|l, r| l.0.cmp(&r.0))
+                .enumerate()
+                .for_each(|(ind, (column_index, nnz))| {
+                    index_ref[ind] = column_index;
+                    value_ref[ind] = nnz;
+                });
+        });
 
     SparsityPattern::try_from_offsets_and_indices(
         num_rows,
