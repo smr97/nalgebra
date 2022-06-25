@@ -15,6 +15,7 @@ use crate::{SparseEntry, SparseEntryMut, SparseFormatError, SparseFormatErrorKin
 use nalgebra::Scalar;
 use num_traits::One;
 
+use std::ops::Range;
 use std::slice::{Iter, IterMut};
 
 /// A CSR representation of a sparse matrix.
@@ -148,6 +149,10 @@ impl<T> CsrMatrix<T> {
         Self {
             cs: CsMatrix::new(nrows, ncols),
         }
+    }
+    /// Get the internal Cs representation
+    pub fn get_cs<'a>(&'a self) -> &'a CsMatrix<T> {
+        &self.cs
     }
 
     /// Try to construct a CSR matrix from raw CSR data.
@@ -513,6 +518,41 @@ impl<T> CsrMatrix<T> {
     /// where the `values` array is mutable.
     pub fn csr_data_mut(&mut self) -> (&[usize], &[usize], &mut [T]) {
         self.cs.cs_data_mut()
+    }
+
+    /// Get a contiguous set of rows of this matrix.
+    /// Each row will be fetched with all the non-zeros, ie. won't cut on the column dimension
+    pub fn get_row_range(&self, set_of_rows: Range<usize>) -> Self
+    where
+        T: Clone,
+    {
+        let offsets = self.pattern().major_offsets();
+        let start = set_of_rows.start;
+        let end = set_of_rows.end + 1;
+        let first_offset = offsets[start];
+        let new_offsets: Vec<_> = offsets[start..end]
+            .iter()
+            .cloned()
+            .map(|some_offset| some_offset - first_offset)
+            .collect();
+
+        let start = offsets[set_of_rows.start];
+        let end = offsets[set_of_rows.end];
+        let new_indices: Vec<_> = self.pattern().minor_indices()[start..end]
+            .iter()
+            .cloned()
+            .collect();
+        let new_values: Vec<_> = self.values()[start..end].iter().cloned().collect();
+        unsafe {
+            let pattern = SparsityPattern::from_offset_and_indices_unchecked(
+                set_of_rows.end - set_of_rows.start,
+                self.pattern().minor_dim(),
+                new_offsets,
+                new_indices,
+            );
+            CsrMatrix::try_from_pattern_and_values(pattern, new_values)
+                .expect("Couldn't filter given rows of the matrix")
+        }
     }
 
     /// Creates a sparse matrix that contains only the explicit entries decided by the
