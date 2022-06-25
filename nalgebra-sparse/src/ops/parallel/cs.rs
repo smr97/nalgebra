@@ -1,4 +1,4 @@
-use itertools::{EitherOrBoth::Both, Itertools};
+//use itertools::{EitherOrBoth::Both, Itertools};
 //use itertools::Itertools;
 use nalgebra::{ClosedAdd, ClosedMul, Scalar};
 use num_traits::{One, Zero};
@@ -139,7 +139,7 @@ pub fn filtered_sptgemm_sequential<'a, T>(
     right_range: Range<usize>,
 ) -> CsMatrix<T>
 where
-    T: Scalar + ClosedAdd + ClosedMul + Zero + One,
+    T: Scalar + ClosedAdd + ClosedMul + Zero + One + Clone,
 {
     let mut offsets = Vec::new();
     let mut indices: Vec<usize> = Vec::new();
@@ -148,33 +148,28 @@ where
     let left_range_copy = left_range.clone();
     let right_range_copy = right_range.clone();
     let mut compute_time = 0u128;
+    let mut scatter_vector: Vec<T> = vec![Zero::zero(); left.pattern().minor_dim()];
 
     for row_index in left_range {
+        //scatter the indices and values into the vector, re-use them for each iteration of the
+        //inner loop
+        let left_lane = left.get_lane(row_index).unwrap();
+        left_lane
+            .minor_indices()
+            .iter()
+            .zip(left_lane.values().iter())
+            .for_each(|(&ind, val)| scatter_vector[ind] = val.clone());
         let right_range_copy = right_range.clone();
         for col_index in right_range_copy {
-            let left_lane = left.get_lane(row_index).unwrap();
             let right_lane = right.get_lane(col_index).unwrap();
-            let left_lane_iter = left_lane
-                .minor_indices()
-                .iter()
-                .zip(left_lane.values().iter());
             let right_lane_iter = right_lane
                 .minor_indices()
                 .iter()
                 .zip(right_lane.values().iter());
             let start = Instant::now();
-            let output: T = left_lane_iter
-                .merge_join_by(right_lane_iter, |(left_pos, _), (right_pos, _)| {
-                    left_pos.cmp(right_pos)
-                })
-                .map(|some_element| {
-                    if let Both(left_tuple, right_tuple) = some_element {
-                        left_tuple.1.clone() * right_tuple.1.clone()
-                    } else {
-                        Zero::zero()
-                    }
-                })
-                .fold(Zero::zero(), |curr_sum, val| curr_sum + val);
+            let output: T = right_lane_iter.fold(Zero::zero(), |curr_sum, (&pos, val)| {
+                curr_sum + scatter_vector[pos].clone() * val.clone()
+            });
             compute_time += start.elapsed().as_nanos();
 
             if !output.is_zero() {
@@ -182,6 +177,10 @@ where
                 indices.push(col_index); //The index array in the output matrix refers to global column indices then.
             }
         }
+        //clear the scatter vector
+        scatter_vector
+            .iter_mut()
+            .for_each(|val| *val = Zero::zero());
         offsets.push(indices.len());
     }
     println!("Compute time was {:?}", compute_time / 1_000_000u128);
