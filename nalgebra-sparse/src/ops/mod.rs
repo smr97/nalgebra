@@ -125,7 +125,9 @@
 //! always be verified by performance profiling!
 
 mod impl_std_ops;
+/// This module defines parallel sparse matrix ops
 pub mod parallel;
+pub use parallel::filtered_sptgemm_sequential;
 pub mod serial;
 
 /// Determines whether a matrix should be transposed in a given operation.

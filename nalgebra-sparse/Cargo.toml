@@ -46,6 +46,10 @@ serde_json = "1.0"
 name = "spmm"
 required-features = ["io"]
 path = "example/spmm.rs"
+[[example]]
+name = "spmm_sequential"
+required-features = ["io"]
+path = "example/spgemm_small_sequential.rs"
 
 [package.metadata.docs.rs]
 # Enable certain features when building docs for docs.rs
