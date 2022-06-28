@@ -117,6 +117,15 @@ where
         if self.left_start == self.left_end || self.right_start == self.right_end {
             None
         } else {
+            let left_matrix = self
+                .left_matrix
+                .get_row_range(self.left_start..self.left_end);
+
+            let right_matrix = self
+                .right_matrix
+                .get_row_range(self.right_start..self.right_end);
+            //transpose the right matrix and multiply
+
             Some(filtered_sptgemm_sequential(
                 self.left_matrix,
                 self.right_matrix,
